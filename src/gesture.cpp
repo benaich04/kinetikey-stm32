@@ -2,48 +2,63 @@
 #include "mbed.h"
 #include <cmath>
 
-static InterruptIn user_button(PC_13);
-static volatile bool button_pressed = false;
-
-// Calibration baseline
+// ─────────────────────────────────────────────
+//  Calibration baseline
+// ─────────────────────────────────────────────
 static float base_ax=0, base_ay=0, base_az=0;
 static float base_gx=0, base_gy=0, base_gz=0;
 
-// Velocity estimates for slide detection
+// ─────────────────────────────────────────────
+//  Velocity integration for slide detection
+// ─────────────────────────────────────────────
 static float vel_x=0, vel_y=0, vel_z=0;
 
-// Debounce
-static uint32_t last_gesture_time = 0;
-static uint32_t last_sample_time  = 0;
+// ─────────────────────────────────────────────
+//  State machine
+//
+//  IDLE      →  board is at rest, looking for gestures
+//  SETTLING  →  gesture just fired, waiting for ALL motion
+//               to die down before accepting anything new.
+//               Braking deceleration is absorbed here.
+// ─────────────────────────────────────────────
+enum MotionState { M_IDLE, M_SETTLING };
+static MotionState motion_state = M_IDLE;
+static uint32_t    quiet_count = 0;
+static uint32_t    last_sample_time = 0;
 
-// Thresholds
+// ─────────────────────────────────────────────
+//  Previous-sample memory for rise detection
+// ─────────────────────────────────────────────
+static float prev_ax=0, prev_ay=0, prev_az=0;
+static float prev_gx=0, prev_gy=0, prev_gz=0;
+
+// ─────────────────────────────────────────────
+//  Tuning constants
+// ─────────────────────────────────────────────
 #define ACCEL_TILT_THRESH      2.5f
 #define ACCEL_SHAKE_THRESH     7.0f
-#define ACCEL_SLIDE_THRESH     1.5f
 #define GYRO_THRESH           60.0f
 #define SLIDE_VEL_THRESH       0.08f
-#define VEL_DECAY              0.85f
-#define DEBOUNCE_MS            400
+
 #define NOISE_FLOOR_XY         0.5f
 #define NOISE_FLOOR_Z          1.5f
+#define VEL_DECAY              0.85f
 #define VEL_CLAMP              2.0f
 
-void on_button_press() {
-    button_pressed = true;
-}
+#define QUIET_ACCEL_THRESH     0.8f
+#define QUIET_GYRO_THRESH     25.0f
+#define QUIET_VEL_THRESH       0.03f
+#define QUIET_SAMPLES_NEEDED   5      // ~100ms at 50Hz
 
+#define MIN_IDLE_MS          100
+
+static uint32_t idle_entry_time = 0;
+
+// ─────────────────────────────────────────────
+//  Calibration (called by main after button press)
+//  Pure math — no button/LED handling here.
+// ─────────────────────────────────────────────
 void Gesture_Calibrate(void) {
-    user_button.fall(&on_button_press);
-
-    DigitalOut led(PB_14);
-    while (!button_pressed) {
-        led = !led;
-        ThisThread::sleep_for(200ms);
-    }
-    led = 0;
-    button_pressed = false;
-
-    // Average 50 samples as baseline
     float sum_ax=0, sum_ay=0, sum_az=0;
     float sum_gx=0, sum_gy=0, sum_gz=0;
 
@@ -56,23 +71,27 @@ void Gesture_Calibrate(void) {
 
     base_ax = sum_ax / 50.0f;
     base_ay = sum_ay / 50.0f;
-    base_az = sum_az / 50.0f;  // this captures gravity (~9.8) on Z
+    base_az = sum_az / 50.0f;
     base_gx = sum_gx / 50.0f;
     base_gy = sum_gy / 50.0f;
     base_gz = sum_gz / 50.0f;
 
-    // Reset everything
+    // Reset all detection state
     vel_x = vel_y = vel_z = 0;
+    prev_ax = prev_ay = prev_az = 0;
+    prev_gx = prev_gy = prev_gz = 0;
+    motion_state = M_IDLE;
+    quiet_count = 0;
     last_sample_time = 0;
-    last_gesture_time = 0;
-
-    led = 1;
-    ThisThread::sleep_for(1000ms);
-    led = 0;
+    idle_entry_time = 0;
 }
 
+// ─────────────────────────────────────────────
+//  Gesture detection
+// ─────────────────────────────────────────────
 Gesture detectGesture(SensorSample sample) {
-    // Subtract baseline — this removes gravity from az automatically
+
+    // Subtract baseline (removes gravity)
     float ax = sample.ax - base_ax;
     float ay = sample.ay - base_ay;
     float az = sample.az - base_az;
@@ -83,81 +102,119 @@ Gesture detectGesture(SensorSample sample) {
     // Time delta
     float dt = 0.02f;
     if (last_sample_time != 0) {
-        float measured_dt = (sample.time_ms - last_sample_time) / 1000.0f;
-        if (measured_dt > 0.005f && measured_dt < 0.2f)
-            dt = measured_dt;
+        float measured = (sample.time_ms - last_sample_time) / 1000.0f;
+        if (measured > 0.005f && measured < 0.2f) dt = measured;
     }
     last_sample_time = sample.time_ms;
+    uint32_t now = sample.time_ms;
 
-    // Integrate acceleration to velocity
-    // Use larger dead zone on Z to kill any residual gravity noise
+    // Integrate velocity (always runs, even while settling)
     if (fabsf(ax) > NOISE_FLOOR_XY) vel_x += ax * dt;
     else                             vel_x *= VEL_DECAY;
-
     if (fabsf(ay) > NOISE_FLOOR_XY) vel_y += ay * dt;
     else                             vel_y *= VEL_DECAY;
-
     if (fabsf(az) > NOISE_FLOOR_Z)  vel_z += az * dt;
     else                             vel_z *= VEL_DECAY;
 
-    // Clamp velocity to prevent runaway drift
     if (fabsf(vel_x) > VEL_CLAMP) vel_x = 0;
     if (fabsf(vel_y) > VEL_CLAMP) vel_y = 0;
     if (fabsf(vel_z) > VEL_CLAMP) vel_z = 0;
 
-    // Debounce
-    uint32_t now = sample.time_ms;
-    if ((now - last_gesture_time) < DEBOUNCE_MS) return NONE;
+    // ── SETTLING: wait for quiet ──
+    if (motion_state == M_SETTLING) {
+        bool is_quiet =
+            fabsf(ax) < QUIET_ACCEL_THRESH &&
+            fabsf(ay) < QUIET_ACCEL_THRESH &&
+            fabsf(az) < QUIET_ACCEL_THRESH &&
+            fabsf(gx) < QUIET_GYRO_THRESH  &&
+            fabsf(gy) < QUIET_GYRO_THRESH  &&
+            fabsf(gz) < QUIET_GYRO_THRESH  &&
+            fabsf(vel_x) < QUIET_VEL_THRESH &&
+            fabsf(vel_y) < QUIET_VEL_THRESH &&
+            fabsf(vel_z) < QUIET_VEL_THRESH;
 
-    // Score every possible gesture and pick highest intensity
+        if (is_quiet) {
+            quiet_count++;
+            if (quiet_count >= QUIET_SAMPLES_NEEDED) {
+                motion_state = M_IDLE;
+                idle_entry_time = now;
+                vel_x = vel_y = vel_z = 0;
+            }
+        } else {
+            quiet_count = 0;
+        }
+
+        prev_ax = ax; prev_ay = ay; prev_az = az;
+        prev_gx = gx; prev_gy = gy; prev_gz = gz;
+        return NONE;
+    }
+
+    // ── M_IDLE: detect gestures ──
+
+    // Anti-jitter guard after settling
+    if (idle_entry_time != 0 && (now - idle_entry_time) < MIN_IDLE_MS) {
+        prev_ax = ax; prev_ay = ay; prev_az = az;
+        prev_gx = gx; prev_gy = gy; prev_gz = gz;
+        return NONE;
+    }
+
+    // Score candidates, pick strongest
     Gesture best_g = NONE;
     float   best_i = 0.0f;
 
     auto check = [&](Gesture g, float intensity) {
-        if (intensity > best_i) {
-            best_g = g;
-            best_i = intensity;
-        }
+        if (intensity > best_i) { best_g = g; best_i = intensity; }
     };
 
-    // --- ROTATIONS (gyro, deg/s) ---
-    if (fabsf(gz) > GYRO_THRESH)
+    // ROTATIONS — require signal is rising
+    if (fabsf(gz) > GYRO_THRESH && fabsf(gz) >= fabsf(prev_gz))
         check(gz > 0 ? ROTATE_CW  : ROTATE_CCW,  fabsf(gz));
-    if (fabsf(gx) > GYRO_THRESH)
+    if (fabsf(gx) > GYRO_THRESH && fabsf(gx) >= fabsf(prev_gx))
         check(gx > 0 ? ROLL_RIGHT : ROLL_LEFT,    fabsf(gx));
-    if (fabsf(gy) > GYRO_THRESH)
+    if (fabsf(gy) > GYRO_THRESH && fabsf(gy) >= fabsf(prev_gy))
         check(gy > 0 ? PITCH_UP   : PITCH_DOWN,   fabsf(gy));
 
-    // --- SHAKES (sudden high acceleration, scaled up to compete with gyro) ---
-    if (fabsf(ax) > ACCEL_SHAKE_THRESH)
+    // SHAKES — require accel is rising
+    if (fabsf(ax) > ACCEL_SHAKE_THRESH && fabsf(ax) >= fabsf(prev_ax))
         check(ax > 0 ? SHAKE_RIGHT    : SHAKE_LEFT,     fabsf(ax) * 8.0f);
-    if (fabsf(ay) > ACCEL_SHAKE_THRESH)
+    if (fabsf(ay) > ACCEL_SHAKE_THRESH && fabsf(ay) >= fabsf(prev_ay))
         check(ay > 0 ? SHAKE_FORWARD  : SHAKE_BACKWARD, fabsf(ay) * 8.0f);
-    if (fabsf(az) > ACCEL_SHAKE_THRESH)
+    if (fabsf(az) > ACCEL_SHAKE_THRESH && fabsf(az) >= fabsf(prev_az))
         check(az > 0 ? SHAKE_UP       : SHAKE_DOWN,     fabsf(az) * 8.0f);
 
-    // --- SLIDES (slow movement via velocity, only if accel is low = not a shake) ---
+    // SLIDES — vel & accel must agree in direction
     if (fabsf(ax) < ACCEL_SHAKE_THRESH && fabsf(vel_x) > SLIDE_VEL_THRESH)
-        check(vel_x > 0 ? SLIDE_RIGHT    : SLIDE_LEFT,     fabsf(vel_x) * 50.0f);
+        if (vel_x * ax > 0 || fabsf(ax) < NOISE_FLOOR_XY)
+            check(vel_x > 0 ? SLIDE_RIGHT   : SLIDE_LEFT,     fabsf(vel_x) * 50.0f);
     if (fabsf(ay) < ACCEL_SHAKE_THRESH && fabsf(vel_y) > SLIDE_VEL_THRESH)
-        check(vel_y > 0 ? SLIDE_FORWARD  : SLIDE_BACKWARD, fabsf(vel_y) * 50.0f);
+        if (vel_y * ay > 0 || fabsf(ay) < NOISE_FLOOR_XY)
+            check(vel_y > 0 ? SLIDE_FORWARD : SLIDE_BACKWARD, fabsf(vel_y) * 50.0f);
     if (fabsf(az) < ACCEL_SHAKE_THRESH && fabsf(vel_z) > SLIDE_VEL_THRESH)
-        check(vel_z > 0 ? SLIDE_UP       : SLIDE_DOWN,     fabsf(vel_z) * 50.0f);
+        if (vel_z * az > 0 || fabsf(az) < NOISE_FLOOR_Z)
+            check(vel_z > 0 ? SLIDE_UP      : SLIDE_DOWN,     fabsf(vel_z) * 50.0f);
 
-    // --- TILTS (sustained angle, only if acceleration is between noise and shake) ---
+    // TILTS — sustained lean
     if (fabsf(ay) > ACCEL_TILT_THRESH && fabsf(ay) < ACCEL_SHAKE_THRESH)
         check(ay > 0 ? TILT_UP    : TILT_DOWN,  fabsf(ay) * 2.0f);
     if (fabsf(ax) > ACCEL_TILT_THRESH && fabsf(ax) < ACCEL_SHAKE_THRESH)
         check(ax > 0 ? TILT_RIGHT : TILT_LEFT,  fabsf(ax) * 2.0f);
 
+    // Accepted → enter settling
     if (best_g != NONE) {
-        last_gesture_time = now;
+        motion_state = M_SETTLING;
+        quiet_count = 0;
         vel_x = vel_y = vel_z = 0;
     }
+
+    prev_ax = ax; prev_ay = ay; prev_az = az;
+    prev_gx = gx; prev_gy = gy; prev_gz = gz;
 
     return best_g;
 }
 
+// ─────────────────────────────────────────────
+//  Gesture names
+// ─────────────────────────────────────────────
 const char* gestureName(Gesture g) {
     switch(g) {
         case TILT_UP:        return "TILT_UP";

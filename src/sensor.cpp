@@ -7,11 +7,10 @@
 #define OUTX_L_G        0x22
 #define OUTX_L_XL       0x28
 
+static I2C i2c(PB_11, PB_10);   // I2C2 — internal sensor bus
 
-static I2C i2c(PB_11, PB_10);  // CORRECT - I2C2, internal sensors bus
-
-static float fax=0,fay=0,faz=0,fgx=0,fgy=0,fgz=0;
-#define ALPHA 0.8f
+static float fax=0, fay=0, faz=0, fgx=0, fgy=0, fgz=0;
+#define ALPHA 0.6f               // EMA smoothing (lower = faster response)
 
 static void sensor_write(uint8_t reg, uint8_t val) {
     char buf[2] = {(char)reg, (char)val};
@@ -27,36 +26,39 @@ static void sensor_read(uint8_t reg, uint8_t *data, int len) {
 void Sensor_Init(void) {
     i2c.frequency(100000);
     ThisThread::sleep_for(10ms);
-    
-    // Check WHO_AM_I register - should return 0x6A
+
     uint8_t who = 0;
     sensor_read(0x0F, &who, 1);
     printf("WHO_AM_I = 0x%02X (expected 0x6A)\r\n", who);
-    
-    sensor_write(CTRL1_XL, 0x40);
-    sensor_write(CTRL2_G,  0x40);
+
+    sensor_write(CTRL1_XL, 0x40);   // 104 Hz, +/-2g
+    sensor_write(CTRL2_G,  0x40);   // 104 Hz, 245 dps
 }
 
 SensorSample getFilteredSample(void) {
     uint8_t raw[6];
 
+    // Gyroscope
     sensor_read(OUTX_L_G, raw, 6);
     int16_t raw_gx = (int16_t)(raw[1]<<8 | raw[0]);
     int16_t raw_gy = (int16_t)(raw[3]<<8 | raw[2]);
     int16_t raw_gz = (int16_t)(raw[5]<<8 | raw[4]);
 
+    // Accelerometer
     sensor_read(OUTX_L_XL, raw, 6);
     int16_t raw_ax = (int16_t)(raw[1]<<8 | raw[0]);
     int16_t raw_ay = (int16_t)(raw[3]<<8 | raw[2]);
     int16_t raw_az = (int16_t)(raw[5]<<8 | raw[4]);
 
-    float ax = raw_ax * 0.000598f;
+    // Convert to physical units
+    float ax = raw_ax * 0.000598f;   // m/s^2
     float ay = raw_ay * 0.000598f;
     float az = raw_az * 0.000598f;
-    float gx = raw_gx * 0.00875f;
+    float gx = raw_gx * 0.00875f;   // deg/s
     float gy = raw_gy * 0.00875f;
     float gz = raw_gz * 0.00875f;
 
+    // EMA low-pass filter
     fax = ALPHA*fax + (1.0f-ALPHA)*ax;
     fay = ALPHA*fay + (1.0f-ALPHA)*ay;
     faz = ALPHA*faz + (1.0f-ALPHA)*az;
