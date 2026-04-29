@@ -25,11 +25,7 @@ The system supports:
 
 The following blueprint summarizes the complete user flow, LED signals, gesture types, and hardware setup.
 
-> Save the generated image inside your project as:
->
-> `docs/kinetikey_user_guide_infographic.png`
-
-![KinetiKey User Guide Blueprint](docs/kinetikey_user_guide_infographic.png)
+![KinetiKey User Guide Blueprint](src/blueprint.png)
 
 ---
 
